@@ -51,15 +51,15 @@ import scala.collection.mutable
 import scala.compat.java8.OptionConverters._
 
 final class KafkaMetadataLog private (
-  val log: UnifiedLog,
-  time: Time,
-  scheduler: Scheduler,
-  // Access to this object needs to be synchronized because it is used by the snapshotting thread to notify the
-  // polling thread when snapshots are created. This object is also used to store any opened snapshot reader.
-  snapshots: mutable.TreeMap[OffsetAndEpoch, Option[FileRawSnapshotReader]],
-  topicPartition: TopicPartition,
-  config: MetadataLogConfig
-) extends ReplicatedLog with Logging {
+                                       val log: UnifiedLog,
+                                       time: Time,
+                                       scheduler: Scheduler,
+                                       // Access to this object needs to be synchronized because it is used by the snapshotting thread to notify the
+                                       // polling thread when snapshots are created. This object is also used to store any opened snapshot reader.
+                                       snapshots: mutable.TreeMap[OffsetAndEpoch, Option[FileRawSnapshotReader]],
+                                       topicPartition: TopicPartition,
+                                       config: MetadataLogConfig
+                                     ) extends ReplicatedLog with Logging {
 
   this.logIdent = s"[MetadataLog partition=$topicPartition, nodeId=${config.nodeId}] "
 
@@ -667,7 +667,7 @@ object KafkaMetadataLog extends Logging {
       }
 
       snapshotsToDelete.foreach { snapshotPath =>
-        Files.deleteIfExists(snapshotPath.path)
+        Snapshots.makeWritableAndDeleteIfExists(snapshotPath.path)
         info(s"Deleted unneeded snapshot file with path $snapshotPath")
       }
     } finally {

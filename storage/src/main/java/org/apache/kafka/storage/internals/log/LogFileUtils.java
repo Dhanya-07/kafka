@@ -19,6 +19,10 @@ package org.apache.kafka.storage.internals.log;
 import java.io.File;
 import java.text.NumberFormat;
 
+import org.apache.kafka.common.record.FileRecords;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 public final class LogFileUtils {
 
     /**
@@ -50,6 +54,7 @@ public final class LogFileUtils {
      * Suffix of an aborted txn index
      */
     public static final String TXN_INDEX_FILE_SUFFIX = ".txnindex";
+    private static final Logger LOGGER = LoggerFactory.getLogger(LogFileUtils.class);
 
     private LogFileUtils() {
     }
@@ -62,7 +67,12 @@ public final class LogFileUtils {
      * @return offset of the given file name
      */
     public static long offsetFromFileName(String fileName) {
-        return Long.parseLong(fileName.substring(0, fileName.indexOf('.')));
+        int dotIndex = fileName.indexOf('.');
+        //LOGGER.info("offsetFromFileName: fileName = "+ fileName+", dotIndex = "+dotIndex);
+        if (dotIndex == -1) {
+            return Long.parseLong(fileName); // No extension
+        }
+        return Long.parseLong(fileName.substring(0, dotIndex));
     }
 
     /**
@@ -110,7 +120,7 @@ public final class LogFileUtils {
      * @param suffix The suffix to be appended to the file name (e.g. "", ".deleted", ".cleaned", ".swap", etc.)
      */
     public static File logFile(File dir, long offset, String suffix) {
-        return new File(dir, filenamePrefixFromOffset(offset) + LOG_FILE_SUFFIX + suffix);
+        return new File(dir, filenamePrefixFromOffset(offset) + LOG_FILE_SUFFIX);
     }
 
     /**
@@ -131,7 +141,7 @@ public final class LogFileUtils {
      * @param suffix The suffix to be appended to the file name ("", ".deleted", ".cleaned", ".swap", etc.)
      */
     public static File offsetIndexFile(File dir, long offset, String suffix) {
-        return new File(dir, filenamePrefixFromOffset(offset) + INDEX_FILE_SUFFIX + suffix);
+        return new File(dir, filenamePrefixFromOffset(offset) + INDEX_FILE_SUFFIX );
     }
 
     /**
@@ -152,7 +162,7 @@ public final class LogFileUtils {
      * @param suffix The suffix to be appended to the file name ("", ".deleted", ".cleaned", ".swap", etc.)
      */
     public static File timeIndexFile(File dir, long offset, String suffix) {
-        return new File(dir, filenamePrefixFromOffset(offset) + TIME_INDEX_FILE_SUFFIX + suffix);
+        return new File(dir, filenamePrefixFromOffset(offset) + TIME_INDEX_FILE_SUFFIX);
     }
 
     /**
@@ -173,7 +183,7 @@ public final class LogFileUtils {
      * @param suffix The suffix to be appended to the file name ("", ".deleted", ".cleaned", ".swap", etc.)
      */
     public static File transactionIndexFile(File dir, long offset, String suffix) {
-        return new File(dir, filenamePrefixFromOffset(offset) + TXN_INDEX_FILE_SUFFIX + suffix);
+        return new File(dir, filenamePrefixFromOffset(offset) + TXN_INDEX_FILE_SUFFIX );
     }
 
     /**

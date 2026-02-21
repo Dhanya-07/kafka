@@ -305,7 +305,7 @@ class LocalLogTest {
     assertEquals(10L, log.segments.numberOfSegments)
 
     val toDelete = log.segments.values.asScala.toVector
-    LocalLog.deleteSegmentFiles(toDelete, asyncDelete = asyncDelete, log.dir, log.topicPartition, log.config, log.scheduler, log.logDirFailureChannel, "")
+    LocalLog.deleteSegmentFiles(toDelete,log.dir,asyncDelete = asyncDelete, log.config, log.scheduler,log.logDirFailureChannel,log.topicPartition)
     if (asyncDelete) {
       toDelete.foreach {
         segment =>

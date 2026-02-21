@@ -41,6 +41,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Optional;
+import java.nio.file.OpenOption;
+import java.nio.file.StandardOpenOption;
 
 /**
  * Local file based quorum state store. It takes the JSON format of {@link QuorumStateData}
@@ -169,26 +171,25 @@ public class FileQuorumStateStore implements QuorumStateStore {
 
         log.trace("Writing tmp quorum state {}", temp.getAbsolutePath());
 
-        try {
-            try (final FileOutputStream fileOutputStream = new FileOutputStream(temp);
-                 final BufferedWriter writer = new BufferedWriter(
-                     new OutputStreamWriter(fileOutputStream, StandardCharsets.UTF_8)
-                 )
-            ) {
-                ObjectNode jsonState = (ObjectNode) QuorumStateDataJsonConverter.write(state, version);
-                jsonState.set(DATA_VERSION, new ShortNode(version));
-                writer.write(jsonState.toString());
-                writer.flush();
-                fileOutputStream.getFD().sync();
-            }
+        final OpenOption[] options = {StandardOpenOption.WRITE,
+                StandardOpenOption.CREATE_NEW, StandardOpenOption.SPARSE};
+        try (BufferedWriter writer = Files.newBufferedWriter(temp.toPath(), StandardCharsets.UTF_8, options)) {
+            // short version = state.highestSupportedVersion(); //diff
+
+            ObjectNode jsonState = (ObjectNode) QuorumStateDataJsonConverter.write(state, version);
+            jsonState.set(DATA_VERSION, new ShortNode(version));
+            writer.write(jsonState.toString());
+            writer.flush();
+            writer.close();
             Utils.atomicMoveWithFallback(temp.toPath(), stateFile.toPath());
-        } catch (IOException e) {
+        }
+        catch (IOException e) {
             throw new UncheckedIOException(
-                String.format(
-                    "Error while writing the Quorum status from the file %s",
-                    stateFile.getAbsolutePath()
-                ),
-                e
+                    String.format(
+                            "Error while writing the Quorum status from the file %s",
+                            stateFile.getAbsolutePath()
+                    ),
+                    e
             );
         } finally {
             // cleanup the temp file when the write finishes (either success or fail).

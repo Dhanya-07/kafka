@@ -28,6 +28,8 @@ import org.apache.kafka.common.utils.ByteUtils;
 import org.apache.kafka.common.utils.Crc32C;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.record.FileRecords;
+import org.slf4j.LoggerFactory;
 
 import org.slf4j.Logger;
 
@@ -39,17 +41,7 @@ import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.OptionalLong;
-import java.util.TreeMap;
+import java.util.*;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -111,6 +103,7 @@ public class ProducerStateManager {
     private final int maxTransactionTimeoutMs;
     private final ProducerStateManagerConfig producerStateManagerConfig;
     private final Time time;
+    private static final Logger LOGGER = LoggerFactory.getLogger(ProducerStateManager.class);
 
     private final Map<Long, ProducerStateEntry> producers = new HashMap<>();
 
@@ -188,7 +181,7 @@ public class ProducerStateManager {
      */
     public VerificationStateEntry maybeCreateVerificationStateEntry(long producerId, int sequence, short epoch) {
         VerificationStateEntry entry = verificationStates.computeIfAbsent(producerId, pid ->
-            new VerificationStateEntry(time.milliseconds(), sequence, epoch)
+                new VerificationStateEntry(time.milliseconds(), sequence, epoch)
         );
         entry.maybeUpdateLowestSequenceAndEpoch(sequence, epoch);
         return entry;
@@ -465,8 +458,13 @@ public class ProducerStateManager {
     public Optional<File> takeSnapshot(boolean sync) throws IOException {
         // If not a new offset, then it is not worth taking another snapshot
         if (lastMapOffset > lastSnapOffset) {
-            SnapshotFile snapshotFile = new SnapshotFile(LogFileUtils.producerSnapshotFile(logDir, lastMapOffset));
+            SnapshotFile snapshotFile = new SnapshotFile(LogSegment.getSnapshotFile(logDir, lastMapOffset));
             long start = time.hiResClockMs();
+            File parentDir = snapshotFile.file().getParentFile();
+            //LOGGER.info("Par Dir: "+parentDir);
+            if (!parentDir.exists()) {
+                parentDir.mkdirs();
+            }
             writeSnapshot(snapshotFile.file(), producers, sync);
             log.info("Wrote producer snapshot at offset {} with {} producer ids in {} ms.", lastMapOffset,
                     producers.size(), time.hiResClockMs() - start);
@@ -730,14 +728,21 @@ public class ProducerStateManager {
 
     // visible for testing
     public static List<SnapshotFile> listSnapshotFiles(File dir) throws IOException {
-        if (dir.exists() && dir.isDirectory()) {
-            try (Stream<Path> paths = Files.list(dir.toPath())) {
-                return paths.filter(ProducerStateManager::isSnapshotFile)
-                        .map(path -> new SnapshotFile(path.toFile())).collect(Collectors.toList());
+        File snapshotDir = LogSegment.getSnapshotDir(dir); // Assumed static method
+
+        if (snapshotDir.exists() && snapshotDir.isDirectory()) {
+            File[] files = snapshotDir.listFiles();
+            if (files != null) {
+                return Arrays.stream(files)
+                        .filter(File::isFile)
+                        .map(SnapshotFile::new)
+                        .collect(Collectors.toList());
             }
-        } else {
-            return Collections.emptyList();
         }
+        return Collections.emptyList();
+    }
+    public static long offsetFromSnapshotFile(File file) {
+        return LogSegment.getSnapshotOffset(file);
     }
 
 }

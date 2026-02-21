@@ -35,6 +35,10 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.event.Level;
+
 /**
  * A {@link Records} implementation backed by a file. An optional start and end position can be applied to this
  * instance to enable slicing a range of the log records.
@@ -50,6 +54,7 @@ public class FileRecords extends AbstractRecords implements Closeable {
     private final AtomicInteger size;
     private final FileChannel channel;
     private volatile File file;
+    private static final Logger LOGGER = LoggerFactory.getLogger(FileRecords.class);
 
     /**
      * The {@code FileRecords.open} methods should be used instead of this constructor whenever possible.
@@ -462,15 +467,14 @@ public class FileRecords extends AbstractRecords implements Closeable {
                                            int initFileSize,
                                            boolean preallocate) throws IOException {
         if (mutable) {
-            if (fileAlreadyExists || !preallocate) {
+            if (preallocate && !fileAlreadyExists) {
+                return Utils.createPreallocatedFile(file.toPath(), initFileSize);
+            } else {
                 return FileChannel.open(file.toPath(), StandardOpenOption.CREATE, StandardOpenOption.READ,
                         StandardOpenOption.WRITE);
-            } else {
-                RandomAccessFile randomAccessFile = new RandomAccessFile(file, "rw");
-                randomAccessFile.setLength(initFileSize);
-                return randomAccessFile.getChannel();
             }
-        } else {
+        }
+        else {
             return FileChannel.open(file.toPath());
         }
     }

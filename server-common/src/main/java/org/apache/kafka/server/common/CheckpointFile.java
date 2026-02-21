@@ -34,6 +34,12 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.nio.file.OpenOption;
+import java.nio.file.StandardOpenOption;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.event.Level;
+
 
 /**
  * This class represents a utility to capture a checkpoint in a file. It writes down to the file in the below format.
@@ -52,6 +58,7 @@ import java.util.Optional;
 public class CheckpointFile<T> {
 
     private final int version;
+    private static final Logger LOGGER = LoggerFactory.getLogger(CheckpointFile.class);
     private final EntryFormatter<T> formatter;
     private final Object lock = new Object();
     private final Path absolutePath;
@@ -74,15 +81,27 @@ public class CheckpointFile<T> {
 
     public void write(Collection<T> entries) throws IOException {
         synchronized (lock) {
+            final OpenOption[] options = {StandardOpenOption.WRITE,
+                    StandardOpenOption.CREATE, StandardOpenOption.SPARSE};
             // write to temp file and then swap with the existing file
-            try (FileOutputStream fileOutputStream = new FileOutputStream(tempPath.toFile());
-                 BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(fileOutputStream, StandardCharsets.UTF_8))) {
-                CheckpointWriteBuffer<T> checkpointWriteBuffer = new CheckpointWriteBuffer<>(writer, version, formatter);
-                checkpointWriteBuffer.write(entries);
-                writer.flush();
-                fileOutputStream.getFD().sync();
-            }
 
+            try (BufferedWriter writer = Files.newBufferedWriter(tempPath, StandardCharsets.UTF_8, options)) {
+                writer.write(Integer.toString(version));
+                writer.newLine();
+
+                // Write the entries count
+                writer.write(Integer.toString(entries.size()));
+                writer.newLine();
+
+                // Write each entry on a new line.
+                for (T entry : entries) {
+                    writer.write(formatter.toString(entry));
+                    writer.newLine();
+                }
+
+                writer.flush();
+                writer.close();
+            }
             Utils.atomicMoveWithFallback(tempPath, absolutePath);
         }
     }

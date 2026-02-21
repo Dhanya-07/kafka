@@ -37,7 +37,7 @@ import org.apache.kafka.server.config.ServerLogConfigs
 import org.apache.kafka.server.util.Scheduler
 import org.apache.kafka.storage.internals.checkpoint.LeaderEpochCheckpointFile
 import org.apache.kafka.storage.internals.log.LogConfig.{DEFAULT_REMOTE_LOG_COPY_DISABLE_CONFIG, DEFAULT_REMOTE_LOG_DELETE_ON_DISABLE_CONFIG}
-import org.apache.kafka.storage.internals.log.{AbortedTxn, AppendOrigin, FetchDataInfo, FetchIsolation, LazyIndex, LogAppendInfo, LogConfig, LogDirFailureChannel, LogFileUtils, LogOffsetsListener, LogSegment, ProducerStateManager, ProducerStateManagerConfig, TransactionIndex}
+import org.apache.kafka.storage.internals.log.{AbortedTxn, AppendOrigin, FetchDataInfo, FetchIsolation, LazyIndex, LogAppendInfo, LogConfig, LogDirFailureChannel, LogFileUtils, LogOffsetsListener, LogSegment, ProducerStateManager, ProducerStateManagerConfig, SegmentFile, SegmentStatus, SegmentStatusHandler, TransactionIndex}
 
 import scala.jdk.CollectionConverters._
 
@@ -49,12 +49,15 @@ object LogTestUtils {
                     logDir: File,
                     indexIntervalBytes: Int = 10,
                     time: Time = Time.SYSTEM): LogSegment = {
-    val ms = FileRecords.open(LogFileUtils.logFile(logDir, offset))
-    val idx = LazyIndex.forOffset(LogFileUtils.offsetIndexFile(logDir, offset), offset, 1000)
-    val timeIdx = LazyIndex.forTime(LogFileUtils.timeIndexFile(logDir, offset), offset, 1500)
-    val txnIndex = new TransactionIndex(offset, UnifiedLog.transactionIndexFile(logDir, offset))
-
-    new LogSegment(ms, idx, timeIdx, txnIndex, offset, indexIntervalBytes, 0, time)
+    val segDir = new File(logDir, String.valueOf(offset))
+    segDir.mkdirs()
+    val statusFile = new File(segDir, SegmentFile.STATUS.getName)
+    SegmentStatusHandler.setStatus(statusFile, SegmentStatus.HOT)
+    val ms = FileRecords.open(new File(segDir, SegmentFile.LOG.getName))
+    val idx = LazyIndex.forOffset(new File(segDir, SegmentFile.OFFSET_INDEX.getName), offset, 1000)
+    val timeIdx = LazyIndex.forTime(new File(segDir, SegmentFile.TIME_INDEX.getName), offset, 1500)
+    val txnIndex = new TransactionIndex(offset, new File(segDir, SegmentFile.TXN_INDEX.getName))
+    new LogSegment(ms, idx, timeIdx, txnIndex, offset, indexIntervalBytes, 0, time, statusFile)
   }
 
   def createLogConfig(segmentMs: Long = LogConfig.DEFAULT_SEGMENT_MS,

@@ -17,6 +17,8 @@
 
 package kafka.log
 
+import org.apache.kafka.storage.internals.log.{CleanerConfig, LogConfig, LogDirFailureChannel, LogSegment, ProducerStateManagerConfig, RemoteIndexCache, SegmentFile, SegmentStatus, SegmentStatusHandler}
+
 import java.io._
 import java.nio.file.{Files, NoSuchFileException}
 import java.util.concurrent._
@@ -45,7 +47,6 @@ import org.apache.kafka.server.common.MetadataVersion
 import org.apache.kafka.storage.internals.log.LogConfig.MessageFormatVersion
 import org.apache.kafka.server.metrics.KafkaMetricsGroup
 import org.apache.kafka.server.util.{FileLock, Scheduler}
-import org.apache.kafka.storage.internals.log.{CleanerConfig, LogConfig, LogDirFailureChannel, ProducerStateManagerConfig, RemoteIndexCache}
 import org.apache.kafka.storage.internals.checkpoint.CleanShutdownFileHandler
 
 import java.util
@@ -96,6 +97,7 @@ class LogManager(logDirs: Seq[File],
   private val futureLogs = new Pool[TopicPartition, UnifiedLog]()
   // Each element in the queue contains the log object to be deleted and the time it is scheduled for deletion.
   private val logsToBeDeleted = new LinkedBlockingQueue[(UnifiedLog, Long)]()
+  private val tpToBeDeleted = new CopyOnWriteArraySet[TopicPartition]()
 
   // Map of stray partition to stray log. This holds all stray logs detected on the broker.
   // Visible for testing
@@ -311,6 +313,7 @@ class LogManager(logDirs: Seq[File],
 
   private def addLogToBeDeleted(log: UnifiedLog): Unit = {
     this.logsToBeDeleted.add((log, time.milliseconds()))
+    this.tpToBeDeleted.add(log.topicPartition)
   }
 
   def addStrayLog(strayPartition: TopicPartition, strayLog: UnifiedLog): Unit = {
@@ -351,7 +354,7 @@ class LogManager(logDirs: Seq[File],
       numRemainingSegments = numRemainingSegments,
       remoteStorageSystemEnable = remoteStorageSystemEnable)
 
-    if (logDir.getName.endsWith(UnifiedLog.DeleteDirSuffix)) {
+    if (LogSegment.getStatus(logDir.getParentFile) == SegmentStatus.DELETED) {
       addLogToBeDeleted(log)
     } else if (logDir.getName.endsWith(UnifiedLog.StrayDirSuffix)) {
       addStrayLog(topicPartition, log)
@@ -361,7 +364,7 @@ class LogManager(logDirs: Seq[File],
       // A KRaft broker with an offline directory may be unable to detect it still holds a to-be-deleted replica,
       // and can create a conflicting topic partition for a new incarnation of the topic in one of the remaining online directories.
       // So upon a restart in which the offline directory is back online we need to clean up the old replica directory.
-      log.renameDir(UnifiedLog.logStrayDirName(log.topicPartition), shouldReinitialize = false)
+      LogSegment.setStatus(new File(logDir.getParentFile, SegmentFile.STATUS.getName), SegmentStatus.DELETED)
       addStrayLog(log.topicPartition, log)
       warn(s"Log in ${logDir.getAbsolutePath} marked stray and renamed to ${log.dir.getAbsolutePath}")
     } else {
@@ -617,9 +620,9 @@ class LogManager(logDirs: Seq[File],
 
   // visible for testing
   private[log] def startupWithConfigOverrides(
-    defaultConfig: LogConfig,
-    topicConfigOverrides: Map[String, LogConfig],
-    isStray: UnifiedLog => Boolean): Unit = {
+                                               defaultConfig: LogConfig,
+                                               topicConfigOverrides: Map[String, LogConfig],
+                                               isStray: UnifiedLog => Boolean): Unit = {
     loadLogs(defaultConfig, topicConfigOverrides, isStray) // this could take a while if shutdown was not clean
 
     /* Schedule the cleanup task to delete old logs */
@@ -1034,6 +1037,10 @@ class LogManager(logDirs: Seq[File],
                      topicId: Option[Uuid], targetLogDirectoryId: Option[Uuid] = Option.empty): UnifiedLog = {
     logCreationOrDeletionLock synchronized {
       val log = getLog(topicPartition, isFuture).getOrElse {
+        while (tpToBeDeleted.contains(topicPartition)) {
+          Thread.sleep(500)
+          warn(s"Can not create log for $topicPartition because current topicPartition: $topicPartition is under deletion ")
+        }
         // create the log if it has not already been created in another thread
         if (!isNew && offlineLogDirs.nonEmpty)
           throw new KafkaStorageException(s"Can not create log for $topicPartition because log directories ${offlineLogDirs.mkString(",")} are offline")
@@ -1161,11 +1168,15 @@ class LogManager(logDirs: Seq[File],
         }
       }
 
-      while ({nextDelayMs = nextDeleteDelayMs; nextDelayMs <= 0}) {
+      while ( {
+        nextDelayMs = nextDeleteDelayMs;
+        nextDelayMs <= 0
+      }) {
         val (removedLog, _) = logsToBeDeleted.take()
         if (removedLog != null) {
           try {
             removedLog.delete()
+            tpToBeDeleted.remove(removedLog.topicPartition)
             info(s"Deleted log for partition ${removedLog.topicPartition} in ${removedLog.dir.getAbsolutePath}.")
           } catch {
             case e: KafkaStorageException =>
@@ -1244,7 +1255,7 @@ class LogManager(logDirs: Seq[File],
   def replaceCurrentWithFutureLog(sourceLog: Option[UnifiedLog], destLog: UnifiedLog, updateHighWatermark: Boolean = false): Unit = {
     val topicPartition = destLog.topicPartition
 
-    destLog.renameDir(UnifiedLog.logDirName(topicPartition), shouldReinitialize = true)
+    LogSegment.setStatus((new File(destLog.dir, SegmentFile.STATUS.getName)), SegmentStatus.HOT)
     // the metrics tags still contain "future", so we have to remove it.
     // we will add metrics back after sourceLog remove the metrics
     destLog.removeLogMetrics()
@@ -1265,7 +1276,7 @@ class LogManager(logDirs: Seq[File],
 
     try {
       sourceLog.foreach { srcLog =>
-        srcLog.renameDir(UnifiedLog.logDeleteDirName(topicPartition), shouldReinitialize = true)
+        LogSegment.setStatus((new File(srcLog.dir, SegmentFile.STATUS.getName)), SegmentStatus.DELETED)
         // Now that replica in source log directory has been successfully renamed for deletion.
         // Close the log, update checkpoint files, and enqueue this log to be deleted.
         srcLog.close()
@@ -1316,10 +1327,13 @@ class LogManager(logDirs: Seq[File],
         }
         if (isStray) {
           // Move aside stray partitions, don't delete them
-          removedLog.renameDir(UnifiedLog.logStrayDirName(topicPartition), shouldReinitialize = false)
+          LogSegment.setStatus((new File(removedLog.dir, SegmentFile.STATUS.getName)), SegmentStatus.DELETED)
+          removedLog.close()
           warn(s"Log for partition ${removedLog.topicPartition} is marked as stray and renamed to ${removedLog.dir.getAbsolutePath}")
         } else {
-          removedLog.renameDir(UnifiedLog.logDeleteDirName(topicPartition), shouldReinitialize = false)
+          //removedLog.renameDir(UnifiedLog.logDeleteDirName(topicPartition), shouldReinitialize = false)
+          LogSegment.setStatus((new File(removedLog.dir, SegmentFile.STATUS.getName)), SegmentStatus.DELETED)
+          removedLog.close()
           addLogToBeDeleted(removedLog)
           info(s"Log for partition ${removedLog.topicPartition} is renamed to ${removedLog.dir.getAbsolutePath} and is scheduled for deletion")
         }

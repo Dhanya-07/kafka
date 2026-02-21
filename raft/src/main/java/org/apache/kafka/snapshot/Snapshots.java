@@ -32,6 +32,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.text.NumberFormat;
 import java.util.Optional;
+import java.io.File;
 
 public final class Snapshots {
     private static final Logger log = LoggerFactory.getLogger(Snapshots.class);
@@ -46,6 +47,7 @@ public final class Snapshots {
     private static final int EPOCH_WIDTH = 10;
 
     public static final OffsetAndEpoch BOOTSTRAP_SNAPSHOT_ID = new OffsetAndEpoch(0, 0);
+    private static final Logger LOGGER = LoggerFactory.getLogger(Snapshots.class);
 
     static {
         OFFSET_FORMATTER.setMinimumIntegerDigits(OFFSET_WIDTH);
@@ -123,7 +125,7 @@ public final class Snapshots {
         Path immutablePath = snapshotPath(logDir, snapshotId);
         Path deletedPath = deleteRenamePath(immutablePath, snapshotId);
         try {
-            boolean deleted = Files.deleteIfExists(immutablePath) | Files.deleteIfExists(deletedPath);
+            boolean deleted = makeWritableAndDeleteIfExists(immutablePath) | makeWritableAndDeleteIfExists(deletedPath);
             if (deleted) {
                 log.info("Deleted snapshot files for snapshot {}.", snapshotId);
             } else {
@@ -176,6 +178,14 @@ public final class Snapshots {
     public static long lastContainedLogTimestamp(Path logDir, OffsetAndEpoch snapshotId) {
         try (FileRawSnapshotReader reader = FileRawSnapshotReader.open(logDir, snapshotId)) {
             return lastContainedLogTimestamp(reader);
+        }
+    }
+    public static boolean makeWritableAndDeleteIfExists(Path path) throws IOException {
+        try {
+            LOGGER.info("File Writable or Not  : {}",  path.toFile().setWritable(true)); // Ensure the file is writable before deletion);
+            return Files.deleteIfExists(path);
+        } catch (IOException ex) {
+            throw ex;
         }
     }
 }

@@ -35,11 +35,14 @@ import java.util.Objects;
 import java.util.OptionalInt;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.nio.file.AccessDeniedException;
+import java.nio.file.StandardOpenOption;
 
 /**
  * The abstract index class which holds entry format agnostic methods.
  */
 public abstract class AbstractIndex implements Closeable {
+    private static final Logger LOGGER = LoggerFactory.getLogger(AbstractIndex.class);
 
     private enum SearchResultType {
         LARGEST_LOWER_BOUND, SMALLEST_UPPER_BOUND
@@ -87,28 +90,59 @@ public abstract class AbstractIndex implements Closeable {
     }
 
     private void createAndAssignMmap() throws IOException {
-        boolean newlyCreated = file.createNewFile();
-        RandomAccessFile raf;
-        if (writable)
-            raf = new RandomAccessFile(file, "rw");
-        else
-            raf = new RandomAccessFile(file, "r");
+        FileChannel finalChannel = null;
+        int retries = 3;
+        try
+        {
+            while (retries-- > 0) {
+                boolean newlyCreated = file.createNewFile();
+                FileChannel channel;
+                if (writable)
+                    channel = FileChannel.open(file.toPath(), StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.SPARSE);
+                else
+                    channel = FileChannel.open(file.toPath(), StandardOpenOption.READ);
+                finalChannel = channel;
 
-        try {
-            /* pre-allocate the file if necessary */
-            if (newlyCreated) {
-                if (maxIndexSize < entrySize())
-                    throw new IllegalArgumentException("Invalid max index size: " + maxIndexSize);
-                raf.setLength(roundDownToExactMultiple(maxIndexSize, entrySize()));
+                try {
+                    /* pre-allocate the file if necessary */
+                    if (newlyCreated) {
+                        if (maxIndexSize < entrySize())
+                            throw new IllegalArgumentException("Invalid max index size: " + maxIndexSize);
+
+                        int size = roundDownToExactMultiple(maxIndexSize, entrySize());
+                        Utils.preallocateFile(channel, size);
+                    }
+
+                    long length = channel.size();
+                    MappedByteBuffer mmap;
+
+                    if (writable)
+                        mmap = channel.map(FileChannel.MapMode.READ_WRITE, 0, length);
+                    else
+                        mmap = channel.map(FileChannel.MapMode.READ_ONLY, 0, length);
+
+                    /* set the position in the index for the next entry */
+                    if (newlyCreated)
+                        mmap.position(0);
+                    else {
+                        // if this is a pre-existing index, assume it is valid and set position to last entry
+                        mmap.position(roundDownToExactMultiple(mmap.limit(), entrySize()));
+                    }
+                    this.length = length;
+                    this.mmap = mmap;
+                    break;
+                } catch (AccessDeniedException e) {
+                    e.printStackTrace();
+                    try {
+                        Thread.sleep(1000);
+                    } catch (Exception exp) {
+                        exp.printStackTrace();
+                    }
+                }
             }
-
-            long length = raf.length();
-            MappedByteBuffer mmap = createMappedBuffer(raf, newlyCreated, length, writable, entrySize());
-
-            this.length = length;
-            this.mmap = mmap;
-        } finally {
-            Utils.closeQuietly(raf, "index " + file.getName());
+        }
+        finally {
+            Utils.closeQuietly(finalChannel, "index " + file.getName());
         }
     }
 
@@ -195,23 +229,23 @@ public abstract class AbstractIndex implements Closeable {
                 log.debug("Index {} was not resized because it already has size {}", file.getAbsolutePath(), roundedNewSize);
                 return false;
             } else {
-                RandomAccessFile raf = new RandomAccessFile(file, "rw");
+                FileChannel channel = FileChannel.open(file.toPath(), StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
                 try {
                     int position = mmap.position();
 
                     /* Windows or z/OS won't let us modify the file length while the file is mmapped :-( */
                     if (OperatingSystem.IS_WINDOWS || OperatingSystem.IS_ZOS)
                         safeForceUnmap();
-                    raf.setLength(roundedNewSize);
+                    Utils.preallocateFile(channel, roundedNewSize);
                     this.length = roundedNewSize;
-                    mmap = raf.getChannel().map(FileChannel.MapMode.READ_WRITE, 0, roundedNewSize);
+                    mmap = channel.map(FileChannel.MapMode.READ_WRITE, 0, roundedNewSize);
                     this.maxEntries = mmap.limit() / entrySize();
                     mmap.position(position);
                     log.debug("Resized {} to {}, position is {} and limit is {}", file.getAbsolutePath(), roundedNewSize,
                             mmap.position(), mmap.limit());
                     return true;
                 } finally {
-                    Utils.closeQuietly(raf, "index file " + file.getName());
+                    Utils.closeQuietly(channel, "index file " + file.getName());
                 }
             }
         } finally {

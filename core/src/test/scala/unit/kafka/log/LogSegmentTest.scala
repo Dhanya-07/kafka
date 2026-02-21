@@ -519,7 +519,7 @@ class LogSegmentTest {
       TopicConfig.SEGMENT_INDEX_BYTES_CONFIG -> 1000,
       TopicConfig.SEGMENT_JITTER_MS_CONFIG -> 0
     ).asJava)
-    val seg = LogSegment.open(tempDir, baseOffset, logConfig, Time.SYSTEM, fileAlreadyExists, initFileSize, preallocate, "")
+    val seg = LogSegment.open(tempDir, baseOffset, logConfig, Time.SYSTEM, fileAlreadyExists, initFileSize, preallocate, SegmentStatus.HOT)
     segments += seg
     seg
   }
@@ -563,7 +563,7 @@ class LogSegmentTest {
     //After close, file should be trimmed
     assertEquals(oldSize, seg.log.file.length)
 
-    val segReopen = LogSegment.open(tempDir, 40, logConfig, Time.SYSTEM, true, 512 * 1024 * 1024, true, "")
+    val segReopen = LogSegment.open(tempDir, 40, logConfig, Time.SYSTEM, true, 512 * 1024 * 1024, true, SegmentStatus.HOT)
     segments += segReopen
 
     val readAgain = segReopen.read(55, 200)

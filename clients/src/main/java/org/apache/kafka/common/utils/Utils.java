@@ -21,6 +21,16 @@ import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.common.network.TransferableChannel;
 
+import java.nio.BufferUnderflowException;
+import java.util.AbstractMap;
+import java.util.EnumSet;
+import java.util.Map.Entry;
+import java.util.SortedSet;
+import java.util.TreeSet;
+import org.apache.kafka.common.record.FileRecords;
+import java.nio.BufferUnderflowException;
+import java.nio.file.OpenOption;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.event.Level;
@@ -1709,5 +1719,33 @@ public final class Utils {
     @FunctionalInterface
     public interface ThrowingRunnable {
         void run() throws Exception;
+    }
+
+    public static FileChannel createPreallocatedFile(Path path, int size) throws IOException {
+        final OpenOption[] options = {StandardOpenOption.READ, StandardOpenOption.WRITE,
+                StandardOpenOption.CREATE, StandardOpenOption.SPARSE};
+        final FileChannel channel = FileChannel.open(path, options);
+
+        preallocateFile(channel, size);
+
+        return channel;
+    }
+
+    /**
+     * Preallocates an existing file
+     * @param channel FileChannel to preallocate
+     * @param size The size used for pre allocate file, for example 512 * 1025 *1024
+     * @throws IOException
+     */
+    public static void preallocateFile(FileChannel channel, int size) throws IOException {
+        if (size < channel.size()) {
+            channel.truncate(size);
+        } else if (size > channel.size()) {
+            channel.position(size - Integer.BYTES);
+            final ByteBuffer buffer = ByteBuffer.allocate(Integer.BYTES).putInt(0);
+            buffer.rewind();
+            channel.write(buffer);
+            channel.position(0);
+        }
     }
 }

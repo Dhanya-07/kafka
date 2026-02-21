@@ -28,6 +28,7 @@ import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.server.metrics.KafkaMetricsGroup;
 import org.apache.kafka.storage.internals.epoch.LeaderEpochFileCache;
+import org.apache.kafka.common.KafkaException;
 
 import com.yammer.metrics.core.MetricName;
 import com.yammer.metrics.core.Timer;
@@ -40,13 +41,9 @@ import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.nio.file.Files;
-import java.nio.file.NoSuchFileException;
+import java.nio.file.*;
 import java.nio.file.attribute.FileTime;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.Optional;
-import java.util.OptionalLong;
+import java.util.*;
 import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
@@ -70,6 +67,7 @@ public class LogSegment implements Closeable {
     /* a directory that is used for future partition */
     private static final String FUTURE_DIR_SUFFIX = "-future";
     private static final Pattern FUTURE_DIR_PATTERN = Pattern.compile("^(\\S+)-(\\S+)\\.(\\S+)" + FUTURE_DIR_SUFFIX);
+    private static final Random random = new Random();
 
     static {
         KafkaMetricsGroup logFlushStatsMetricsGroup = new KafkaMetricsGroup(LogSegment.class) {
@@ -91,6 +89,7 @@ public class LogSegment implements Closeable {
     private final int indexIntervalBytes;
     private final long rollJitterMs;
     private final Time time;
+    public  File segDir=null;
 
     // The timestamp we used for time based log rolling and for ensuring max compaction delay
     // volatile for LogCleaner to see the update
@@ -124,7 +123,8 @@ public class LogSegment implements Closeable {
                       long baseOffset,
                       int indexIntervalBytes,
                       long rollJitterMs,
-                      Time time) {
+                      Time time,
+                      File dir) {
         this.log = log;
         this.lazyOffsetIndex = lazyOffsetIndex;
         this.lazyTimeIndex = lazyTimeIndex;
@@ -134,6 +134,7 @@ public class LogSegment implements Closeable {
         this.rollJitterMs = rollJitterMs;
         this.time = time;
         this.created = time.milliseconds();
+        this.segDir = dir;
     }
 
     public OffsetIndex offsetIndex() throws IOException {
@@ -172,8 +173,38 @@ public class LogSegment implements Closeable {
         boolean reachedRollMs = timeWaitedForRoll(rollParams.now, rollParams.maxTimestampInMessages) > rollParams.maxSegmentMs - rollJitterMs;
         int size = size();
         return size > rollParams.maxSegmentBytes - rollParams.messagesSize ||
-            (size > 0 && reachedRollMs) ||
-            offsetIndex().isFull() || timeIndex().isFull() || !canConvertToRelativeOffset(rollParams.maxOffsetInMessages);
+                (size > 0 && reachedRollMs) ||
+                offsetIndex().isFull() || timeIndex().isFull() || !canConvertToRelativeOffset(rollParams.maxOffsetInMessages);
+    }
+    public SegmentStatus getSegmentStatus() {
+        try {
+            return SegmentStatusHandler.getStatus(new File(segDir, SegmentFile.STATUS.getName()));
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+    public void changeSegmentStatus(SegmentStatus segmentStatus) {
+        changeSegmentStatus(SegmentStatus.HOT, segmentStatus);
+    }
+
+    /**
+     * Change the status for this log segment.
+     * IOException from this method should be handled by the caller.
+     */
+    public void changeSegmentStatus(SegmentStatus oldStatus, SegmentStatus newStatus) {
+        try {
+            File file = new File(segDir, SegmentFile.STATUS.getName());
+            SegmentStatus segStatus = SegmentStatusHandler.getStatus(file);
+            if (segStatus == oldStatus) {
+                SegmentStatusHandler.setStatus(file, newStatus);
+            } else {
+                throw new KafkaException(String.format("Invalid Segment Status %s, expected %s", segStatus, oldStatus));
+            }
+        }
+        catch (Exception e) {
+            e.printStackTrace();
+        }
+
     }
 
     public void resizeIndexes(int size) throws IOException {
@@ -771,7 +802,7 @@ public class LogSegment implements Closeable {
     /**
      * Close file handlers used by the log segment but don't write to disk. This is used when the disk may have failed
      */
-    void closeHandlers() {
+    public void closeHandlers() {
         Utils.swallow(LOGGER, Level.WARN, "offsetIndex", () -> lazyOffsetIndex.closeHandler());
         Utils.swallow(LOGGER, Level.WARN, "timeIndex", () -> lazyTimeIndex.closeHandler());
         Utils.swallow(LOGGER, Level.WARN, "log", () -> log.closeHandlers());
@@ -784,10 +815,10 @@ public class LogSegment implements Closeable {
     public void deleteIfExists() throws IOException {
         try {
             Utils.tryAll(asList(
-                () -> deleteTypeIfExists(() -> log.deleteIfExists(), "log", log.file(), true),
-                () -> deleteTypeIfExists(() -> lazyOffsetIndex.deleteIfExists(), "offset index", offsetIndexFile(), true),
-                () -> deleteTypeIfExists(() -> lazyTimeIndex.deleteIfExists(), "time index", timeIndexFile(), true),
-                () -> deleteTypeIfExists(() -> txnIndex.deleteIfExists(), "transaction index", txnIndex.file(), false)));
+                    () -> deleteTypeIfExists(() -> log.deleteIfExists(), "log", log.file(), true),
+                    () -> deleteTypeIfExists(() -> lazyOffsetIndex.deleteIfExists(), "offset index", offsetIndexFile(), true),
+                    () -> deleteTypeIfExists(() -> lazyTimeIndex.deleteIfExists(), "time index", timeIndexFile(), true),
+                    () -> deleteTypeIfExists(() -> txnIndex.deleteIfExists(), "transaction index", txnIndex.file(), false)));
         } catch (Throwable t) {
             if (t instanceof IOException)
                 throw (IOException) t;
@@ -870,21 +901,92 @@ public class LogSegment implements Closeable {
     }
 
     public static LogSegment open(File dir, long baseOffset, LogConfig config, Time time, int initFileSize, boolean preallocate) throws IOException {
-        return open(dir, baseOffset, config, time, false, initFileSize, preallocate, "");
+        return open(dir, baseOffset, config, time, false, initFileSize, preallocate, SegmentStatus.HOT);
     }
 
-    public static LogSegment open(File dir, long baseOffset, LogConfig config, Time time, boolean fileAlreadyExists,
-                                  int initFileSize, boolean preallocate, String fileSuffix) throws IOException {
+    public static LogSegment open(File segDir, long baseOffset, LogConfig config, Time time,
+                                  boolean fileAlreadyExists, int initFileSize,
+                                  boolean preallocate, SegmentStatus segmentStatus) throws IOException {
         int maxIndexSize = config.maxIndexSize;
+        //LOGGER.info("Opening dir : {}",segDir.getAbsolutePath());
+        if (!fileAlreadyExists) {
+            //LOGGER.info("Opening Exists????? : {}",fileAlreadyExists);
+            SegmentStatusHandler.setStatus(new File(segDir, SegmentFile.STATUS.getName()), segmentStatus);
+        }
+
+        //LOGGER.info("Checking ????? : {}",baseOffset+"."+SegmentFile.LOG.getName());
+        File logFile=new File(segDir, LogFileUtils.filenamePrefixFromOffset(baseOffset)+"."+SegmentFile.LOG.getName());
+        File offsetFile=new File(segDir,  LogFileUtils.filenamePrefixFromOffset(baseOffset)+"."+SegmentFile.OFFSET_INDEX.getName());
+        File timeFile=new File(segDir,  LogFileUtils.filenamePrefixFromOffset(baseOffset)+"."+SegmentFile.TIME_INDEX.getName());
+        File tranxFile=new File(segDir,  LogFileUtils.filenamePrefixFromOffset(baseOffset)+"."+SegmentFile.TXN_INDEX.getName());
+
+/*        SegmentStatusHandler.setStatus(logFile, segmentStatus);
+        SegmentStatusHandler.setStatus(offsetFile, segmentStatus);
+        SegmentStatusHandler.setStatus(timeFile, segmentStatus);
+        SegmentStatusHandler.setStatus(tranxFile, segmentStatus);*/
+
         return new LogSegment(
-            FileRecords.open(LogFileUtils.logFile(dir, baseOffset, fileSuffix), fileAlreadyExists, initFileSize, preallocate),
-            LazyIndex.forOffset(LogFileUtils.offsetIndexFile(dir, baseOffset, fileSuffix), baseOffset, maxIndexSize),
-            LazyIndex.forTime(LogFileUtils.timeIndexFile(dir, baseOffset, fileSuffix), baseOffset, maxIndexSize),
-            new TransactionIndex(baseOffset, LogFileUtils.transactionIndexFile(dir, baseOffset, fileSuffix)),
-            baseOffset,
-            config.indexInterval,
-            config.randomSegmentJitter(),
-            time);
+                FileRecords.open(logFile, fileAlreadyExists, initFileSize, preallocate),
+                LazyIndex.forOffset(offsetFile, baseOffset = baseOffset, maxIndexSize = maxIndexSize),
+                LazyIndex.forTime(timeFile, baseOffset = baseOffset, maxIndexSize = maxIndexSize),
+                new TransactionIndex(baseOffset, tranxFile),
+                baseOffset,
+                config.indexInterval,
+                config.randomSegmentJitter(),
+                time,
+                segDir
+        );
+    }
+    public static boolean isSegmentDir(File file) {
+        return file.isDirectory() && !file.getName().equals("snapshot");
+    }
+
+    public static File[] getCleanedSegmentFiles(File logDir, long offset) {
+        String fNameDir = String.valueOf(offset);
+        String fNameDyn = fNameDir + "-";
+        File[] files = logDir.listFiles();
+        if (files == null) {
+            return new File[0]; // Return an empty array if no files exist
+        }
+        List<File> cleanedFiles = new ArrayList<>();
+        for (File file : files) {
+            if ((file.getName().startsWith(fNameDyn) || file.getName().equals(fNameDir))
+                    && getStatus(file) == SegmentStatus.CLEANED) {
+                cleanedFiles.add(file);
+            }
+        }
+        return cleanedFiles.toArray(new File[0]);
+    }
+
+    public static File getSegmentDir(File logDir, long baseOffset, boolean randomDigits) {
+        return new File(logDir, randomDigits ? baseOffset + "-" + random.nextInt(100000) : String.valueOf(baseOffset));
+    }
+
+    public static long getSegmentOffset(File segDir) {
+        String name = segDir.getName();
+        int index = name.indexOf("-");
+        if (index > -1) {
+            return Long.parseLong(name.substring(0, index));
+        } else {
+            return Long.parseLong(name);
+        }
+    }
+    //working meth
+    public static void deleteIfExists(File segDir) throws IOException {
+        LOGGER.info("Deleting segment directory: {}", segDir.getAbsolutePath());
+        if (segDir.exists()) {
+            File[] files = segDir.listFiles();
+            if (files != null) {
+                // LOGGER.info("Deleting Dir files count: {}", files.length);
+                for (File file : files) {
+                    LOGGER.info("Deleting Dir files : {}", file.getAbsolutePath());
+                    LOGGER.info("Directory Writable or Not  : {}",  file.setWritable(true)); // Ensure the file is writable before deletion);
+                    Files.deleteIfExists(file.toPath());
+                }
+            }
+            LOGGER.info("File Writable or Not  : {}",  segDir.setWritable(true)); // Ensure the file is writable before deletion);
+            Files.deleteIfExists(segDir.toPath());
+        }
     }
 
     public static void deleteIfExists(File dir, long baseOffset, String fileSuffix) throws IOException {
@@ -897,5 +999,82 @@ public class LogSegment implements Closeable {
     private static boolean deleteFileIfExists(File file) throws IOException {
         return Files.deleteIfExists(file.toPath());
     }
+    public static void deleteIndicesIfExist(Long baseOffset,File segDir) {
+        try {
+            makeWritableAndDeleteIfExists(new File(segDir,  LogFileUtils.filenamePrefixFromOffset(baseOffset)+"."+SegmentFile.OFFSET_INDEX.getName()).toPath());
+            makeWritableAndDeleteIfExists(new File(segDir, LogFileUtils.filenamePrefixFromOffset(baseOffset)+"."+SegmentFile.TIME_INDEX.getName()).toPath());
+            makeWritableAndDeleteIfExists(new File(segDir, LogFileUtils.filenamePrefixFromOffset(baseOffset)+"."+SegmentFile.TXN_INDEX.getName()).toPath());
+        } catch (Exception e) {
+            // Handle exception appropriately
+            LOGGER.info("Error deleting index files in: " + segDir.getAbsolutePath());
+            e.printStackTrace();
+        }
+    }
+    public static boolean makeWritableAndDeleteIfExists(Path path) throws IOException {
+        try {
+            LOGGER.info("File Writable or Not  : {}",  path.toFile().setWritable(true)); // Ensure the file is writable before deletion);
+            return Files.deleteIfExists(path);
+        } catch (IOException ex) {
+            throw ex;
+        }
+    }
 
+    public static File getSnapshotDir(File logDir) {
+        return new File(logDir, ".snapshot");
+    }
+
+    public static File getSnapshotFile(File logDir, long baseOffset) {
+        //File segDir = new File(logDir, "snapshot");
+        //return new File(logDir, String.valueOf(baseOffset) + ".snapshot");
+        return new File(logDir, LogFileUtils.filenamePrefixFromOffset(baseOffset)+ ".snapshot");
+    }
+
+    public static long getSnapshotOffset(File snapshot) {
+        return Long.parseLong(snapshot.getName());
+    }
+
+    // Assuming getStatus method exists in SegmentStatusHandler
+    public static SegmentStatus getStatus(File segDir) {
+        //LOGGER.info("Statusssss: "+segDir);
+        File statusFile = new File(segDir, SegmentFile.STATUS.getName());
+        if (statusFile.exists()) {
+            //  LOGGER.info("Statusssss:true "+segDir);
+            try {
+                return SegmentStatusHandler.getStatus(statusFile);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        } else {
+            return SegmentStatus.UNKNOWN;
+        }
+    }
+    public static void setStatus(File segDir, SegmentStatus status) {
+        try {
+            SegmentStatusHandler.setStatus(segDir, status);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static boolean isSegmentFileExists(File dir, long baseOffset, SegmentFile segmentFile) {
+        File segDir = new File(dir, String.valueOf(baseOffset));
+        return new File(segDir, segmentFile.getName()).exists();
+    }
+
+    public static boolean isSegmentFileExists(File segDir, SegmentFile segmentFile) {
+        return new File(segDir, segmentFile.getName()).exists();
+    }
+
+    public static boolean canReadSegment(File segDir) {
+        File[] files = segDir.listFiles();
+        if (files == null) {
+            return true; // If there are no files, assume it's readable
+        }
+        for (File file : files) {
+            if (file.isFile() && !file.canRead()) {
+                return false;
+            }
+        }
+        return true;
+    }
 }

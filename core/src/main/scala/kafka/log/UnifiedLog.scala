@@ -20,6 +20,7 @@ package kafka.log
 import com.yammer.metrics.core.MetricName
 import kafka.common.{OffsetsOutOfOrderException, UnexpectedAppendOffsetException}
 import kafka.log.LocalLog.nextOption
+import kafka.log.UnifiedLog.{IndexFileSuffix, TimeIndexFileSuffix, TxnIndexFileSuffix}
 import kafka.log.remote.RemoteLogManager
 import kafka.server.{BrokerTopicStats, RequestLocal}
 import kafka.utils._
@@ -47,6 +48,7 @@ import org.apache.kafka.storage.log.metrics.BrokerTopicMetrics
 import java.io.{File, IOException}
 import java.nio.file.{Files, Path}
 import java.util
+import java.util.concurrent.{ConcurrentHashMap, ConcurrentMap, ConcurrentNavigableMap, ConcurrentSkipListMap, ScheduledFuture}
 import java.util.concurrent.{ConcurrentHashMap, ConcurrentMap, ScheduledFuture}
 import java.util.stream.Collectors
 import java.util.{Collections, Optional, OptionalInt, OptionalLong}
@@ -2028,6 +2030,7 @@ object UnifiedLog extends Logging {
   private[log] val FutureDirPattern = LocalLog.FutureDirPattern
 
   val UnknownOffset: Long = LocalLog.UnknownOffset
+  var localCache: LocalLog = _
 
   def isRemoteLogEnabled(remoteStorageSystemEnable: Boolean,
                          config: LogConfig,
@@ -2093,6 +2096,7 @@ object UnifiedLog extends Logging {
     ).load()
     val localLog = new LocalLog(dir, config, segments, offsets.recoveryPoint,
       offsets.nextOffsetMetadata, scheduler, time, topicPartition, logDirFailureChannel)
+    localCache= localLog
     new UnifiedLog(offsets.logStartOffset,
       localLog,
       brokerTopicStats,
@@ -2224,7 +2228,7 @@ object UnifiedLog extends Logging {
                                       scheduler: Scheduler,
                                       logDirFailureChannel: LogDirFailureChannel,
                                       logPrefix: String): Unit = {
-    LocalLog.deleteSegmentFiles(segmentsToDelete, asyncDelete, dir, topicPartition, config, scheduler, logDirFailureChannel, logPrefix)
+    LocalLog.deleteSegmentFiles(segmentsToDelete,dir,asyncDelete,  config, scheduler,logDirFailureChannel,topicPartition)
   }
 
   /**
@@ -2363,8 +2367,8 @@ object UnifiedLog extends Logging {
       deleteProducerSnapshots()
   }
 
-  private[log] def createNewCleanedSegment(dir: File, logConfig: LogConfig, baseOffset: Long): LogSegment = {
-    LocalLog.createNewCleanedSegment(dir, logConfig, baseOffset)
+  private[log] def createNewCleanedSegment(dir: File, logConfig: LogConfig, scheduler: Scheduler, baseOffset: Long): LogSegment = {
+    LocalLog.createNewCleanedSegment(dir, logConfig, scheduler, baseOffset)
   }
 
   // Visible for benchmarking

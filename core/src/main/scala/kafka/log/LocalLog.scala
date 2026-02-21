@@ -17,6 +17,9 @@
 
 package kafka.log
 
+import org.apache.kafka.storage.internals.log.SegmentStatus
+import org.apache.kafka.storage.internals.log.SegmentStatusHandler
+import org.apache.kafka.storage.internals.log.SegmentFile
 import kafka.utils.Logging
 import org.apache.kafka.common.errors.{KafkaStorageException, OffsetOutOfRangeException}
 import org.apache.kafka.common.message.FetchResponseData
@@ -25,10 +28,13 @@ import org.apache.kafka.common.utils.{Time, Utils}
 import org.apache.kafka.common.{KafkaException, TopicPartition}
 import org.apache.kafka.server.util.Scheduler
 import org.apache.kafka.storage.internals.log.{AbortedTxn, FetchDataInfo, LogConfig, LogDirFailureChannel, LogFileUtils, LogOffsetMetadata, LogSegment, LogSegments, OffsetPosition}
+import kafka.log.LogLoader
+import kafka.log.UnifiedLog.{IndexFileSuffix, TimeIndexFileSuffix, TxnIndexFileSuffix}
 
 import java.io.{File, IOException}
 import java.nio.file.Files
 import java.util
+import java.util.concurrent.{ConcurrentNavigableMap, ConcurrentSkipListMap}
 import java.util.concurrent.atomic.AtomicLong
 import java.util.regex.Pattern
 import java.util.{Collections, Optional}
@@ -64,7 +70,7 @@ case class SplitSegmentResult(deletedSegments: Iterable[LogSegment], newSegments
  */
 class LocalLog(@volatile private var _dir: File,
                @volatile private[log] var config: LogConfig,
-               private[log] val segments: LogSegments,
+               val segments: LogSegments,
                @volatile private[log] var recoveryPoint: Long,
                @volatile private var nextOffsetMetadata: LogOffsetMetadata,
                private[log] val scheduler: Scheduler,
@@ -286,7 +292,7 @@ class LocalLog(@volatile private var _dir: File,
       toDelete.foreach { segment =>
         segments.remove(segment.baseOffset)
       }
-      LocalLog.deleteSegmentFiles(toDelete, asyncDelete, dir, topicPartition, config, scheduler, logDirFailureChannel, logIdent)
+      LocalLog.deleteSegmentFiles(toDelete,dir,asyncDelete = asyncDelete, config, scheduler,logDirFailureChannel,topicPartition)
     }
   }
 
@@ -309,8 +315,6 @@ class LocalLog(@volatile private var _dir: File,
                                           segmentToDelete: LogSegment,
                                           asyncDelete: Boolean,
                                           reason: SegmentDeletionReason): LogSegment = {
-    if (newOffset == segmentToDelete.baseOffset)
-      segmentToDelete.changeFileSuffixes("", LogFileUtils.DELETED_FILE_SUFFIX)
 
     val newSegment = LogSegment.open(dir,
       newOffset,
@@ -323,7 +327,7 @@ class LocalLog(@volatile private var _dir: File,
     reason.logReason(List(segmentToDelete))
     if (newOffset != segmentToDelete.baseOffset)
       segments.remove(segmentToDelete.baseOffset)
-    LocalLog.deleteSegmentFiles(List(segmentToDelete), asyncDelete, dir, topicPartition, config, scheduler, logDirFailureChannel, logIdent)
+    LocalLog.deleteSegmentFiles(List(segmentToDelete),dir,asyncDelete, config, scheduler,logDirFailureChannel,topicPartition)
 
     newSegment
   }
@@ -595,6 +599,8 @@ object LocalLog extends Logging {
   private[log] val StrayDirPattern = Pattern.compile(s"^(\\S+)-(\\S+)\\.(\\S+)$StrayDirSuffix")
 
   private[log] val UnknownOffset = -1L
+  val deletedSegments: ConcurrentNavigableMap[File, java.lang.Boolean] = new ConcurrentSkipListMap[File, java.lang.Boolean]
+  val deleteLock = new Object;
 
   /**
    * Return a directory name to rename the log directory to for async deletion.
@@ -764,7 +770,7 @@ object LocalLog extends Logging {
 
       while (position < sourceRecords.sizeInBytes) {
         val firstBatch = sourceRecords.batchesFrom(position).asScala.head
-        val newSegment = createNewCleanedSegment(dir, config, firstBatch.baseOffset)
+        val newSegment = createNewCleanedSegment(dir, config, scheduler,firstBatch.baseOffset)
         newSegments += newSegment
 
         val bytesAppended = newSegment.appendFromFile(sourceRecords, position)
@@ -860,7 +866,7 @@ object LocalLog extends Logging {
     // need to do this in two phases to be crash safe AND do the delete asynchronously
     // if we crash in the middle of this we complete the swap in loadSegments()
     if (!isRecoveredSwapFile)
-      sortedNewSegments.reverse.foreach(_.changeFileSuffixes(CleanedFileSuffix, SwapFileSuffix))
+      sortedNewSegments.reverse.foreach(_.changeSegmentStatus(SegmentStatus.CLEANED, SegmentStatus.SWAP))
     sortedNewSegments.reverse.foreach(existingSegments.add)
     val newSegmentBaseOffsets = sortedNewSegments.map(_.baseOffset).toSet
 
@@ -869,20 +875,20 @@ object LocalLog extends Logging {
       // remove the index entry
       if (seg.baseOffset != sortedNewSegments.head.baseOffset)
         existingSegments.remove(seg.baseOffset)
+      seg.closeHandlers()
       deleteSegmentFiles(
         List(seg),
-        asyncDelete = true,
         dir,
-        topicPartition,
+        asyncDelete = true,
         config,
         scheduler,
         logDirFailureChannel,
-        logPrefix)
+        topicPartition)
       if (newSegmentBaseOffsets.contains(seg.baseOffset)) Option.empty else Some(seg)
     }.filter(item => item.isDefined).map(item => item.get)
 
     // okay we are safe now, remove the swap suffix
-    sortedNewSegments.foreach(_.changeFileSuffixes(SwapFileSuffix, ""))
+    sortedNewSegments.foreach(_.changeSegmentStatus(SegmentStatus.SWAP, SegmentStatus.HOT))
     Utils.flushDir(dir.toPath)
     deletedNotReplaced
   }
@@ -906,22 +912,25 @@ object LocalLog extends Logging {
    * @param logPrefix The logging prefix
    * @throws IOException if the file can't be renamed and still exists
    */
-  private[log] def deleteSegmentFiles(segmentsToDelete: immutable.Iterable[LogSegment],
+  private[log] def deleteSegmentFiles(segmentsToDelete: immutable.Iterable[LogSegment], dir: File,
                                       asyncDelete: Boolean,
-                                      dir: File,
-                                      topicPartition: TopicPartition,
                                       config: LogConfig,
                                       scheduler: Scheduler,
                                       logDirFailureChannel: LogDirFailureChannel,
-                                      logPrefix: String): Unit = {
+                                      topicPartition: TopicPartition): Unit = {
     segmentsToDelete.foreach { segment =>
-      if (!segment.hasSuffix(LogFileUtils.DELETED_FILE_SUFFIX))
-        segment.changeFileSuffixes("", LogFileUtils.DELETED_FILE_SUFFIX)
+      //info("Bef closing")
+      segment.closeHandlers()
+      System.gc();
+      Thread.sleep(100) // Optional: allow GC to unmap buffers before delete
+      // info("after closing")
+      segment.changeSegmentStatus(SegmentStatus.DELETED)
     }
 
     def deleteSegments(): Unit = {
-      info(s"${logPrefix}Deleting segment files ${segmentsToDelete.mkString(",")}")
+      info(s"Deleting segment files ${segmentsToDelete.mkString(",")}")
       val parentDir = dir.getParent
+      // info(s"after closing par : $parentDir")
       maybeHandleIOException(logDirFailureChannel, parentDir, s"Error while deleting segments for $topicPartition in dir $parentDir") {
         segmentsToDelete.foreach { segment =>
           segment.deleteIfExists()
@@ -929,10 +938,13 @@ object LocalLog extends Logging {
       }
     }
 
-    if (asyncDelete)
+    if (asyncDelete) {
       scheduler.scheduleOnce("delete-file", () => deleteSegments(), config.fileDeleteDelayMs)
-    else
+    }
+    else {
+      //  LogSegment.deleteIfExists(dir)
       deleteSegments()
+    }
   }
 
   private[log] def emptyFetchDataInfo(fetchOffsetMetadata: LogOffsetMetadata,
@@ -946,9 +958,11 @@ object LocalLog extends Logging {
       abortedTransactions)
   }
 
-  private[log] def createNewCleanedSegment(dir: File, logConfig: LogConfig, baseOffset: Long): LogSegment = {
-    LogSegment.deleteIfExists(dir, baseOffset, CleanedFileSuffix)
-    LogSegment.open(dir, baseOffset, logConfig, Time.SYSTEM, false, logConfig.initFileSize, logConfig.preallocate, CleanedFileSuffix)
+  private[log] def createNewCleanedSegment(segDir: File, logConfig: LogConfig, scheduler: Scheduler, baseOffset: Long): LogSegment = {
+    info(s"createNewCleanedSegment file: $segDir")
+    LogSegment.deleteIfExists(segDir, baseOffset)
+    LogSegment.open(segDir, baseOffset, logConfig, Time.SYSTEM, false,
+      logConfig.initFileSize(), logConfig.preallocate, SegmentStatus.CLEANED)
   }
 
   /**
